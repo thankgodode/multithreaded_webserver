@@ -276,7 +276,11 @@ fn handle_connections(mut stream: TcpStream)->Result<(), ParseError>{
 
         let close = wants_close(&request);
 
-        write_response(&mut stream, 200, "text/html", index_contents(), close)?;
+        let path = &request.path;
+
+        println!("PATH: {:?}", path);
+
+        write_response(&mut stream, 200, "text/html", index_contents(path).as_str(), close)?;
 
         if close{
             break;
@@ -298,9 +302,16 @@ fn wants_close(request: &Requests)-> bool{
     opted_out || (request.version == Version::Http10 && !request.headers.contains_key("connection"))
 }
 
-fn index_contents() -> &'static str{
-    static CONTENTS: OnceLock<String> = OnceLock::new();
-    CONTENTS.get_or_init(|| fs::read_to_string("./src/hello.html").unwrap_or_default())
+fn index_contents(paths:&String) -> String{
+
+    let content = match paths.as_str(){
+        "/" => "./src/hello.html",
+        "/about"=> "./src/about.html",
+        "/profile"=> "./src/profile.html",
+        _=> "/"
+    };
+    
+    fs::read_to_string(content).unwrap_or_default()
 }
 
 fn write_response(
