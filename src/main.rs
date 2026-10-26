@@ -1,10 +1,20 @@
-use std::{collections::{HashMap, hash_map::Entry}, fs, io::{self, BufRead, BufReader, ErrorKind, Write}, net::{TcpListener, TcpStream}, sync::{Arc, Mutex, OnceLock, mpsc::{self, Receiver, Sender}}, thread::{self, JoinHandle}, time::Duration};
+use std::{collections::{HashMap, hash_map::Entry}, fs, io::{self, BufRead, BufReader, ErrorKind, Write}, net::{TcpListener, TcpStream}, sync::{Arc, Mutex, mpsc::{self, Receiver, Sender}}, thread::{self, JoinHandle}, time::Duration};
 
 pub const MAX_HEADER_BYTES: usize = 16 * 1024; // request line + all headers
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_HEADERS: usize = 100;
-/// How long an idle keep-alive connection may hold a worker thread.
+/// How long an idle keep-alive connection may hold a connection/worker slot.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+// Bench endpoints. They stay identical on the single_threaded and
+// multi_threaded branches so that only the concurrency model changes.
+const DEFAULT_CPU_ITERS: u64 = 1_000_000;
+const MAX_CPU_ITERS: u64 = 250_000_000;
+const DEFAULT_SLEEP_MS: u64 = 10;
+const MAX_SLEEP_MS: u64 = 5_000;
+const DEFAULT_MEMORY_BYTES: usize = 4 * 1024;
+const MAX_MEMORY_BYTES: usize = 1024 * 1024;
+
 type Job = Box<dyn FnOnce() + Send +'static>;
 struct ThreadPool{
     sender: Sender<Job>,
@@ -119,7 +129,7 @@ impl ParseError{
             ParseError::UnsupportedVersion =>505,
             ParseError::TooManyHeaders | ParseError::HeadersTooLarge => 431,
             ParseError::BodyTooLarge => 413,
-            ParseError::Io(_) => 408,            
+            ParseError::Io(_) => 408,
             _ =>{
                 400
             }
@@ -147,16 +157,25 @@ impl From<io::Error> for ParseError{
 }
 
 fn main() -> io::Result<()>{
-    let listener = TcpListener::bind("127.0.0.1:8080")?;
+    let addr = std::env::var("SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+    let listener = TcpListener::bind(&addr)?;
 
-    let pools = ThreadPool::new(4);
+    let pool_size = std::env::var("SERVER_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4);
+    let pools = ThreadPool::new(pool_size);
 
-    println!("Server listening on port 8080");
+    println!("Server listening on {addr} (fixed thread pool: {pool_size} workers)");
 
     for stream in listener.incoming(){
         let stream = match stream{
             Ok(stream) => stream,
-            Err(_) => panic!("Error unwrapping stream")
+            Err(e) =>{
+                eprintln!("accept failed: {e}");
+                continue;
+            }
         };
 
         pools.execute(|| {
@@ -249,8 +268,8 @@ fn read_requests<R: BufRead>(r: &mut R)-> Result<Option<Requests>, ParseError>{
 }
 
 fn handle_connections(mut stream: TcpStream)->Result<(), ParseError>{
-    // An idle keep-alive connection would otherwise pin a worker thread
-    // forever once the client stops sending.
+    // An idle keep-alive connection would otherwise block the only
+    // connection slot forever once the client stops sending.
     stream.set_read_timeout(Some(IDLE_TIMEOUT))?;
     // Responses are small; don't wait on Nagle between request and reply.
     let _ = stream.set_nodelay(true);
@@ -269,16 +288,23 @@ fn handle_connections(mut stream: TcpStream)->Result<(), ParseError>{
                 // Protocol error: answer once, then drop the connection
                 // because the request framing is no longer trustworthy.
                 let body = format!("{}\n", e.status());
-                write_response(&mut stream, e.status(), "text/plain", &body, true)?;
+                write_response(&mut stream, e.status(), "text/plain; charset=utf-8", body.as_bytes(), true, false)?;
                 break;
             }
         };
 
-        let close = wants_close(&request);
+        let close = wants_close(&request) || query_u64(&request, "close") == Some(1);
+        let head_only = matches!(request.method, Methods::Head);
+        let response = route(&request);
 
-        let path = &request.path;
-
-        write_response(&mut stream, 200, "text/html", index_contents(path).as_str(), close)?;
+        write_response(
+            &mut stream,
+            response.status,
+            response.content_type,
+            &response.body,
+            close,
+            head_only,
+        )?;
 
         if close{
             break;
@@ -300,28 +326,100 @@ fn wants_close(request: &Requests)-> bool{
     opted_out || (request.version == Version::Http10 && !request.headers.contains_key("connection"))
 }
 
-fn index_contents(paths:&String) -> String{
+struct Response{
+    status: u16,
+    content_type: &'static str,
+    body: Vec<u8>,
+}
 
-    let content = match paths.as_str(){
-        "/" => "./src/hello.html",
-        "/about"=> "./src/about.html",
-        "/profile"=> "./src/profile.html",
-        _=> "/"
-    };
-    
-    fs::read_to_string(content).unwrap_or_default()
+impl Response{
+    fn new(status: u16, content_type: &'static str, body: Vec<u8>) -> Response{
+        Response{status, content_type, body}
+    }
+
+    fn text(status: u16, body: &str) -> Response{
+        Response::new(status, "text/plain; charset=utf-8", body.as_bytes().to_vec())
+    }
+
+    fn json(body: String) -> Response{
+        Response::new(200, "application/json", body.into_bytes())
+    }
+}
+
+fn route(request: &Requests) -> Response{
+    match request.path.as_str(){
+        "/" | "/index.html" | "/hello.html" => static_file("./src/hello.html", "text/html; charset=utf-8"),
+        "/about" => static_file("./src/about.html", "text/html; charset=utf-8"),
+        "/profile" => static_file("./src/profile.html", "text/html; charset=utf-8"),
+        "/json" => Response::json("{\"ok\":true}".to_string()),
+        // CPU-bound: a fixed amount of integer work per request.
+        "/cpu" =>{
+            let iterations = query_u64(request, "iters")
+                .unwrap_or(DEFAULT_CPU_ITERS)
+                .min(MAX_CPU_ITERS);
+            let checksum = cpu_work(iterations);
+            Response::json(format!(r#"{{"iterations":{iterations},"checksum":{checksum}}}"#))
+        }
+        // Concurrency-bound: the handler blocks without using CPU.
+        "/sleep" =>{
+            let ms = query_u64(request, "ms")
+                .unwrap_or(DEFAULT_SLEEP_MS)
+                .min(MAX_SLEEP_MS);
+            thread::sleep(Duration::from_millis(ms));
+            Response::json(format!(r#"{{"slept_ms":{ms}}}"#))
+        }
+        // Memory/network-bound: a response built without touching the disk.
+        "/memory" =>{
+            let bytes = query_u64(request, "bytes")
+                .unwrap_or(DEFAULT_MEMORY_BYTES as u64)
+                .min(MAX_MEMORY_BYTES as u64) as usize;
+            Response::new(200, "application/octet-stream", vec![b'x'; bytes])
+        }
+        _ => Response::text(404, "404 Not Found\n"),
+    }
+}
+
+fn static_file(path: &str, content_type: &'static str) -> Response{
+    match fs::read(path){
+        Ok(body) => Response::new(200, content_type, body),
+        Err(_) => Response::text(404, "404 Not Found\n"),
+    }
+}
+
+fn query_u64(request: &Requests, name: &str) -> Option<u64>{
+    request
+        .query
+        .iter()
+        .find(|(k, _)| k == name)
+        .and_then(|(_, v)| v.parse().ok())
+}
+
+/// Pure CPU work with a data dependency so the optimizer cannot remove it.
+fn cpu_work(iterations: u64) -> u64{
+    let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ iterations;
+
+    for _ in 0..iterations{
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+    }
+
+    std::hint::black_box(state)
 }
 
 fn write_response(
     stream: &mut TcpStream,
     status: u16,
     content_type: &str,
-    body: &str,
+    body: &[u8],
     close: bool,
+    head_only: bool,
 )-> Result<(), ParseError>{
     let reason = match status{
         200 => "OK",
         400 => "Bad Request",
+        404 => "Not Found",
         408 => "Request Timeout",
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
@@ -337,7 +435,9 @@ fn write_response(
     );
 
     stream.write_all(head.as_bytes())?;
-    stream.write_all(body.as_bytes())?;
+    if !head_only{
+        stream.write_all(body)?;
+    }
     stream.flush()?;
 
     Ok(())
