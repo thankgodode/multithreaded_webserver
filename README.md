@@ -17,6 +17,10 @@ only difference under load is the concurrency model. See
 ```
 
 The harness builds both branches in release mode, warms up, repeats each
-measurement, pins the server and load generator to separate CPUs, and reports
-throughput, latency, errors, CPU use, and run-to-run spread for CPU-bound,
-file/static, in-memory, and blocking-I/O workloads.
+measurement, pins the server and load generator to separate CPUs when enough
+physical cores are available, and reports throughput, latency, errors, CPU use,
+and run-to-run spread for CPU-bound, file/static, in-memory, and blocking-I/O
+workloads.
+
+A snapshot from a 2-core/4-thread laptop is in
+[`bench/RESULTS.md`](bench/RESULTS.md).

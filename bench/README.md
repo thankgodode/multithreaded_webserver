@@ -115,6 +115,19 @@ branch now uses the same request parser and response loop as the multi-threaded
 branch, so the comparison is about concurrency, not about one server being
 unable to speak HTTP.
 
+## When the load generator is the bottleneck
+
+On small machines, `/json`, `/memory`, and sometimes `/` can hit the load
+generator's ceiling before the server's ceiling. The tell-tale signs are:
+
+- both branches report nearly the same RPS,
+- server CPU stays well below one core per worker,
+- increasing connections does not increase RPS.
+
+In those cases the RPS comparison says "the client is the bottleneck", not
+"the multi-threaded server is slower". The CPU-bound and sleep workloads are
+the cleanest tests because the server is doing measurable work per request.
+
 ## Recommendations for the cleanest numbers
 
 1. Close other CPU-heavy applications (browsers, IDEs, Docker builds).
