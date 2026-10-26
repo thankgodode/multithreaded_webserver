@@ -278,8 +278,6 @@ fn handle_connections(mut stream: TcpStream)->Result<(), ParseError>{
 
         let path = &request.path;
 
-        println!("PATH: {:?}", path);
-
         write_response(&mut stream, 200, "text/html", index_contents(path).as_str(), close)?;
 
         if close{
